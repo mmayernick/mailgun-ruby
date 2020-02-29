@@ -10,9 +10,6 @@ module Railgun
   # Mailgun.
   class Mailer
 
-    # List of the headers that will be ignored when copying headers from `mail.header_fields`
-    IGNORED_HEADERS = %w[ to from subject reply-to ]
-
     # [Hash] config ->
     #   Requires *at least* `api_key` and `domain` keys.
     attr_accessor :config, :domain, :settings
@@ -74,6 +71,7 @@ module Railgun
   #
   # @return [Hash] transformed message hash
   def transform_for_mailgun(mail)
+    mail.headers(mail.mailgun_headers || {})
     message = build_message_object(mail)
 
     # v:* attributes (variables)
@@ -85,47 +83,6 @@ module Railgun
     mail.mailgun_options.try(:each) do |k, v|
       message["o:#{k}"] = v
     end
-
-    # support for using ActionMailer's `headers()` inside of the mailer
-    # note: this will filter out parameters such as `from`, `to`, and so forth
-    #       as they are accepted as POST parameters on the message endpoint.
-
-    msg_headers = Hash.new
-
-    # h:* attributes (headers)
-
-    # Let's set all of these headers on the [Mail::Message] so that
-    # the are created inside of a [Mail::Header] instance and processed there.
-    mail.headers(mail.mailgun_headers || {})
-    mail.header_fields.each do |field|
-      header = field.name.downcase
-      if msg_headers.include? header
-        msg_headers[header] = [msg_headers[header], field.value].flatten
-      else
-        msg_headers[header] = field.value
-      end
-    end
-
-    msg_headers.each do |k, v|
-      if Railgun::Mailer::IGNORED_HEADERS.include? k.downcase
-        Rails.logger.debug("[railgun] ignoring header (using envelope instead): #{k}")
-        next
-      end
-
-      # Cover cases like `cc`, `bcc` where parameters are valid
-      # headers BUT they are submitted as separate POST params
-      # and already exist on the message because of the call to
-      # `build_message_object`.
-      if message.include? k.downcase
-        Rails.logger.debug("[railgun] ignoring header (already set): #{k}")
-        next
-      end
-
-      message["h:#{k}"] = v
-    end
-
-    # recipient variables
-    message['recipient-variables'] = mail.mailgun_recipient_variables.to_json if mail.mailgun_recipient_variables
 
     # reject blank values
     message.delete_if do |k, v|
@@ -147,89 +104,27 @@ module Railgun
   #
   # @returns [Hash] Message hash from Mailgun::MessageBuilder
   def build_message_object(mail)
-    mb = Mailgun::MessageBuilder.new
-
-    mb.from mail[:from]
-    mb.reply_to(mail[:reply_to].to_s) if mail[:reply_to].present?
-    mb.subject mail.subject
-    mb.body_html extract_body_html(mail)
-    mb.body_text extract_body_text(mail)
+    message = {
+      message: mail.encoded,
+      to: []
+    }
 
     [:to, :cc, :bcc].each do |rcpt_type|
       addrs = mail[rcpt_type] || nil
       case addrs
       when String
         # Likely a single recipient
-        mb.add_recipient rcpt_type.to_s, addrs
+        message[:to] << addrs
       when Array
         addrs.each do |addr|
-          mb.add_recipient rcpt_type.to_s, addr
+          message[:to] << addr
         end
       when Mail::Field
-        mb.add_recipient rcpt_type.to_s, addrs.to_s
+        message[:to] << addrs.to_s
       end
     end
 
-    return mb.message if mail.attachments.empty?
-
-    mail.attachments.each do |attach|
-      attach = Attachment.new(attach, encoding: 'ascii-8bit', inline: attach.inline?)
-      attach.attach_to_message! mb
-    end
-
-    return mb.message
-  end
-
-  # Returns the decoded HTML body from the Mail::Message object if available,
-  # otherwise nil.
-  #
-  # @param [Mail::Message] mail message to transform
-  #
-  # @return [String]
-  def extract_body_html(mail)
-    begin
-      retrieve_html_part(mail).body.decoded || nil
-    rescue
-      nil
-    end
-  end
-
-  # Returns the decoded text body from the Mail::Message object if it is available,
-  # otherwise nil.
-  #
-  # @param [Mail::Message] mail message to transform
-  #
-  # @return [String]
-  def extract_body_text(mail)
-    begin
-      retrieve_text_part(mail).body.decoded || nil
-    rescue
-      nil
-    end
-  end
-
-  # Returns the mail object from the Mail::Message object if text part exists,
-  # (decomposing multipart into individual format if necessary)
-  # otherwise nil.
-  #
-  # @param [Mail::Message] mail message to transform
-  #
-  # @return [Mail::Message] mail message with its content-type = text/plain
-  def retrieve_text_part(mail)
-    return mail.text_part if mail.multipart?
-    (mail.mime_type =~ /^text\/plain$/i) && mail
-  end
-
-  # Returns the mail object from the Mail::Message object if html part exists,
-  # (decomposing multipart into individual format if necessary)
-  # otherwise nil.
-  #
-  # @param [Mail::Message] mail message to transform
-  #
-  # @return [Mail::Message] mail message with its content-type = text/html
-  def retrieve_html_part(mail)
-    return mail.html_part if mail.multipart?
-    (mail.mime_type =~ /^text\/html$/i) && mail
+    message
   end
 
 end
